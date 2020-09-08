@@ -34,14 +34,14 @@ import android.os.Build;
 import android.os.ParcelUuid;
 import android.os.Parcelable;
 
+import java.security.InvalidParameterException;
+import java.util.UUID;
+
 import androidx.annotation.IntRange;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.RawRes;
 import androidx.annotation.RequiresApi;
-
-import java.security.InvalidParameterException;
-import java.util.UUID;
 
 /**
  * Starting the DfuService service requires a knowledge of some EXTRA_* constants used to pass
@@ -78,10 +78,12 @@ public final class DfuServiceInitiator {
 	private boolean keepBond;
 	private boolean restoreBond;
 	private boolean forceDfu = false;
+	private boolean forceScanningForNewAddressInLegacyDfu = false;
 	private boolean enableUnsafeExperimentalButtonlessDfu = false;
 	private boolean disableResume = false;
 	private int numberOfRetries = 0; // 0 to be backwards compatible
 	private int mbrSize = DEFAULT_MBR_SIZE;
+	private long dataObjectDelay = 0; // initially disabled
 
 	private Boolean packetReceiptNotificationsEnabled;
 	private int numberOfPackets = 12;
@@ -151,13 +153,18 @@ public final class DfuServiceInitiator {
 
 	/**
 	 * Sets whether the bond information should be preserver after flashing new application.
-	 * This feature requires DFU Bootloader version 0.6 or newer (SDK 8.0.0+).
+	 * This feature requires Legacy DFU Bootloader version 0.6 or newer (SDK 8.0.0+).
 	 * Please see the {@link DfuBaseService#EXTRA_KEEP_BOND} for more information regarding
-	 * requirements. Remember that currently updating the Soft Device will remove the bond
-	 * information.
+	 * requirements.
 	 * <p>
 	 * This flag is ignored when Secure DFU Buttonless Service is used. It will keep or remove the
 	 * bond depending on the Buttonless service type.
+	 * <p>
+	 * <b>Important:</b> The flag does not ensure that the DFU is performed on an encrypted link.
+	 * If the bond information is present only on Android side, but not on the peripheral side,
+	 * Android (version 4.3-10) will connect without encryption. On those versions it is not possible
+	 * to ensure the link is truly encrypted, as {@link BluetoothDevice#getBondState()} returns
+	 * {@link BluetoothDevice#BOND_BONDED} also if bonding isn't used.
 	 *
 	 * @param keepBond whether the bond information should be preserved in the new application.
 	 * @return the builder
@@ -168,7 +175,8 @@ public final class DfuServiceInitiator {
 	}
 
 	/**
-	 * Sets whether the bond should be created after the DFU is complete.
+	 * Sets whether a new bond should be created after the DFU is complete. The old bond
+	 * information will be removed before.
 	 * Please see the {@link DfuBaseService#EXTRA_RESTORE_BOND} for more information regarding
 	 * requirements.
 	 * <p>
@@ -180,6 +188,30 @@ public final class DfuServiceInitiator {
 	 */
 	public DfuServiceInitiator setRestoreBond(final boolean restoreBond) {
 		this.restoreBond = restoreBond;
+		return this;
+	}
+
+	/**
+	 * This method sets the duration of a delay, that the service will wait before sending each
+	 * data object in Secure DFU. The delay will be done after a data object is created, and before
+	 * any data byte is sent. The default value is 0, which disables this feature.
+	 * <p>
+	 * It has been found, that a delay of at least 300ms reduces the risk of packet lose (the
+	 * bootloader needs some time to prepare flash memory) on DFU bootloader from SDK 15 and 16.
+	 * The delay does not have to be longer than 400 ms, as according to performed tests, such delay
+	 * is sufficient.
+	 * <p>
+	 * The longer the delay, the more time DFU will take to complete (delay will be repeated for
+	 * each data object (4096 bytes)). However, with too small delay a packet lose may occur,
+	 * causing the service to enable PRN and set them to 1 making DFU process very, very slow
+	 * (but reliable).
+	 *
+	 * @param delay the initial delay that the service will wait before sending each data object.
+	 * @since 1.10
+	 * @return the builder
+	 */
+	public DfuServiceInitiator setPrepareDataObjectDelay(final long delay) {
+		this.dataObjectDelay = delay;
 		return this;
 	}
 
@@ -251,6 +283,29 @@ public final class DfuServiceInitiator {
 	@SuppressWarnings("JavaDoc")
 	public DfuServiceInitiator setForceDfu(final boolean force) {
 		this.forceDfu = force;
+		return this;
+	}
+
+	/**
+	 * When this is set to true, the Legacy Buttonless Service will scan for the device advertising
+	 * with an incremented MAC address, instead of trying to reconnect to the same device.
+	 * <p>
+	 * Setting this to true requires modifying the buttonless service on the device not to share the
+	 * peer data with the bootloader, or modifying the bootloader to always advertise with MAC+1.
+	 * Setting it to true with a default implementation of the buttonless service should work, but
+	 * is pointless.
+	 * <p>
+	 * This is a feature equivalent to
+	 * <a href="https://github.com/NordicSemiconductor/IOS-Pods-DFU-Library/pull/374">PR #374</a>
+	 * in DFU library for iOS.
+	 * @param force set to true when your bootloader is advertising with an incremented MAC address.
+	 *              By default, in Legacy DFU, the bootloader uses the same MAC address and is
+	 *              advertising directly. This does not seen to work on some phones (Samsung) with
+	 *              recent Android versions.
+	 * @return the builder
+	 */
+	public DfuServiceInitiator setForceScanningForNewAddressInLegacyDfu(final boolean force) {
+		this.forceScanningForNewAddressInLegacyDfu = force;
 		return this;
 	}
 
@@ -756,9 +811,11 @@ public final class DfuServiceInitiator {
 		intent.putExtra(DfuBaseService.EXTRA_KEEP_BOND, keepBond);
 		intent.putExtra(DfuBaseService.EXTRA_RESTORE_BOND, restoreBond);
 		intent.putExtra(DfuBaseService.EXTRA_FORCE_DFU, forceDfu);
+		intent.putExtra(DfuBaseService.EXTRA_FORCE_SCANNING_FOR_BOOTLOADER_IN_LEGACY_DFU, forceScanningForNewAddressInLegacyDfu);
 		intent.putExtra(DfuBaseService.EXTRA_DISABLE_RESUME, disableResume);
 		intent.putExtra(DfuBaseService.EXTRA_MAX_DFU_ATTEMPTS, numberOfRetries);
 		intent.putExtra(DfuBaseService.EXTRA_MBR_SIZE, mbrSize);
+		intent.putExtra(DfuBaseService.EXTRA_DATA_OBJECT_DELAY, dataObjectDelay);
 		if (mtu > 0)
 			intent.putExtra(DfuBaseService.EXTRA_MTU, mtu);
 		intent.putExtra(DfuBaseService.EXTRA_CURRENT_MTU, currentMtu);

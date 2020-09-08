@@ -260,7 +260,6 @@ import no.nordicsemi.android.dfu.internal.exception.UploadAbortedException;
 			String value = preferences.getString(DfuSettingsConstants.SETTINGS_NUMBER_OF_PACKETS, String.valueOf(DfuServiceInitiator.DEFAULT_PRN_VALUE));
 			int numberOfPackets;
 			try {
-				//noinspection ConstantConditions
 				numberOfPackets = Integer.parseInt(value);
 				if (numberOfPackets < 0 || numberOfPackets > 0xFFFF)
 					numberOfPackets = DfuServiceInitiator.DEFAULT_PRN_VALUE;
@@ -465,7 +464,8 @@ import no.nordicsemi.android.dfu.internal.exception.UploadAbortedException;
 
 			if (restoreBond && (mFileType & DfuBaseService.TYPE_APPLICATION) > 0) {
 				// Restore pairing when application was updated.
-				createBond();
+				if (!createBond())
+					logw("Creating bond failed");
 				alreadyWaited = false;
 			}
 		}

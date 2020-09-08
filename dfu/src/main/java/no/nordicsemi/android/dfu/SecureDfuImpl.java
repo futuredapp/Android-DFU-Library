@@ -82,6 +82,8 @@ class SecureDfuImpl extends BaseCustomDfuImpl {
 	private BluetoothGattCharacteristic mControlPointCharacteristic;
 	private BluetoothGattCharacteristic mPacketCharacteristic;
 
+	private long prepareObjectDelay;
+
 	private final SecureBluetoothCallback mBluetoothCallback = new SecureBluetoothCallback();
 
 	protected class SecureBluetoothCallback extends BaseCustomBluetoothCallback {
@@ -101,6 +103,7 @@ class SecureDfuImpl extends BaseCustomDfuImpl {
 			if (responseType == OP_CODE_RESPONSE_CODE_KEY) {
 				final int requestType = characteristic.getIntValue(BluetoothGattCharacteristic.FORMAT_UINT8, 1);
 
+				//noinspection SwitchStatementWithTooFewBranches
 				switch (requestType) {
 					case OP_CODE_CALCULATE_CHECKSUM_KEY: {
 						final int offset = characteristic.getIntValue(BluetoothGattCharacteristic.FORMAT_UINT32, 3);
@@ -222,6 +225,8 @@ class SecureDfuImpl extends BaseCustomDfuImpl {
 			logi("Requesting MTU = " + requiredMtu);
 			requestMtu(requiredMtu);
 		}
+
+		prepareObjectDelay = intent.getLongExtra(DfuBaseService.EXTRA_DATA_OBJECT_DELAY, 0);
 
 		try {
 			// Enable notifications
@@ -549,8 +554,18 @@ class SecureDfuImpl extends BaseCustomDfuImpl {
 					// If the whole page was sent and CRC match, we have to make sure it was executed
 					if (bytesSentNotExecuted == info.maxSize && info.offset < mImageSizeInBytes) {
 						logi("Executing data object (Op Code = 4)");
-						writeExecute();
-						mService.sendLogBroadcast(DfuBaseService.LOG_LEVEL_APPLICATION, "Data object executed");
+						try {
+							writeExecute();
+							mService.sendLogBroadcast(DfuBaseService.LOG_LEVEL_APPLICATION, "Data object executed");
+						} catch (final RemoteDfuException e) {
+							// In DFU bootloader from SDK 15.x, 16 and 17 there's a bug, which
+							// prevents executing an object that has already been executed.
+							// See: https://github.com/NordicSemiconductor/Android-DFU-Library/issues/252
+							if (e.getErrorNumber() != SecureDfuError.OPERATION_NOT_PERMITTED) {
+								throw e;
+							}
+							mService.sendLogBroadcast(DfuBaseService.LOG_LEVEL_APPLICATION, "Data object already executed");
+						}
 					} else {
 						resumeSendingData = true;
 					}
@@ -579,8 +594,7 @@ class SecureDfuImpl extends BaseCustomDfuImpl {
 			mProgressInfo.setBytesSent(0);
 		}
 
-		final long initialDelay = 400; // ms
-		final long startTime = SystemClock.elapsedRealtime() + initialDelay;
+		final long startTime = SystemClock.elapsedRealtime();
 
 		if (info.offset < mImageSizeInBytes) {
 			int attempt = 1;
@@ -593,9 +607,11 @@ class SecureDfuImpl extends BaseCustomDfuImpl {
 					writeCreateRequest(OBJECT_DATA, availableObjectSizeInBytes);
 					mService.sendLogBroadcast(DfuBaseService.LOG_LEVEL_APPLICATION,
                             "Data object (" + (currentChunk + 1) + "/" + chunkCount + ") created");
-					if (currentChunk == 0) {
-						// Waiting until the device is ready to receive first data object.
-						mService.waitFor(initialDelay);
+					// Waiting until the device is ready to receive the data object.
+					// If prepare data object delay was set in the initiator, the delay will be used
+					// for all data objects.
+					if (prepareObjectDelay > 0 || chunkCount == 0) {
+						mService.waitFor(prepareObjectDelay > 0 ? prepareObjectDelay : 400);
 					}
 					mService.sendLogBroadcast(DfuBaseService.LOG_LEVEL_APPLICATION,
                             "Uploading firmware...");
@@ -636,6 +652,12 @@ class SecureDfuImpl extends BaseCustomDfuImpl {
 					} catch (final IOException e) {
 						loge("Error while reading firmware stream", e);
 						mService.terminateConnection(gatt, DfuBaseService.ERROR_FILE_IO_EXCEPTION);
+						return;
+					} catch (final Throwable tr) {
+						// crash fix
+						// Check https://github.com/NordicSemiconductor/Android-DFU-Library/issues/229
+						loge("Progress lost. Bytes sent: " + mProgressInfo.getBytesSent(), tr);
+						mService.terminateConnection(gatt, DfuBaseService.ERROR_PROGRESS_LOST);
 						return;
 					}
 					// To decrease the chance of loosing data next time let's set PRN to 1.
@@ -859,9 +881,9 @@ class SecureDfuImpl extends BaseCustomDfuImpl {
 			throw new RemoteDfuException("Selecting object failed", status);
 
 		final ObjectInfo info = new ObjectInfo();
-		info.maxSize = mControlPointCharacteristic.getIntValue(BluetoothGattCharacteristic.FORMAT_UINT32, 3);
-		info.offset = mControlPointCharacteristic.getIntValue(BluetoothGattCharacteristic.FORMAT_UINT32, 3 + 4);
-		info.CRC32 = mControlPointCharacteristic.getIntValue(BluetoothGattCharacteristic.FORMAT_UINT32, 3 + 8);
+		info.maxSize = unsignedBytesToInt(response, 3);
+		info.offset = unsignedBytesToInt(response, 3 + 4);
+		info.CRC32  = unsignedBytesToInt(response, 3 + 8);
 		return info;
 	}
 
@@ -891,9 +913,14 @@ class SecureDfuImpl extends BaseCustomDfuImpl {
 			throw new RemoteDfuException("Receiving Checksum failed", status);
 
 		final ObjectChecksum checksum = new ObjectChecksum();
-		checksum.offset = mControlPointCharacteristic.getIntValue(BluetoothGattCharacteristic.FORMAT_UINT32, 3);
-		checksum.CRC32 = mControlPointCharacteristic.getIntValue(BluetoothGattCharacteristic.FORMAT_UINT32, 3 + 4);
+		checksum.offset = unsignedBytesToInt(response, 3);
+		checksum.CRC32  = unsignedBytesToInt(response, 3 + 4);
 		return checksum;
+	}
+
+	private int unsignedBytesToInt(@NonNull final byte[] array, final int offset) {
+		return (array[offset] & 0xFF) + ((array[offset + 1] & 0xFF) << 8)
+			+ ((array[offset + 2] & 0xFF) << 16) + ((array[offset + 3] & 0xFF) << 24);
 	}
 
 	/**
@@ -968,11 +995,11 @@ class SecureDfuImpl extends BaseCustomDfuImpl {
 		}
 	}
 
-	private class ObjectInfo extends ObjectChecksum {
+	private static class ObjectInfo extends ObjectChecksum {
 		int maxSize;
 	}
 
-	private class ObjectChecksum {
+	private static class ObjectChecksum {
 		int offset;
 		int CRC32;
 	}

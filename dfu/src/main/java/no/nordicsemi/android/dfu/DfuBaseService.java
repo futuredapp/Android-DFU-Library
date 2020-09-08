@@ -203,6 +203,12 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 	 * In such case set the value of this property to true.
 	 */
 	public static final String EXTRA_FORCE_DFU = "no.nordicsemi.android.dfu.extra.EXTRA_FORCE_DFU";
+
+	/**
+	 * This flag indicates whether the service should scan for bootloader in Legacy DFU after
+	 * switching using buttonless service. The default value is false.
+	 */
+	public static final String EXTRA_FORCE_SCANNING_FOR_BOOTLOADER_IN_LEGACY_DFU = "no.nordicsemi.android.dfu.extra.EXTRA_FORCE_SCANNING_FOR_BOOTLOADER_IN_LEGACY_DFU";
 	/**
 	 * This options allows to disable the resume feature in Secure DFU. When the extra value is set
 	 * to true, the DFU will send Init Packet and Data again, despite the firmware might have been
@@ -233,8 +239,8 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 	 */
 	public static final String EXTRA_CURRENT_MTU = "no.nordicsemi.android.dfu.extra.EXTRA_CURRENT_MTU";
 	/**
-	 * Set this flag to true to enable experimental buttonless feature in Secure DFU. When the
-	 * experimental Buttonless DFU Service is found on a device, the service will use it to
+	 * Set this flag to true to enable experimental buttonless feature in Secure DFU from SDK 12.
+	 * When the experimental Buttonless DFU Service is found on a device, the service will use it to
 	 * switch the device to the bootloader mode, connect to it in that mode and proceed with DFU.
 	 * <p>
 	 * <b>Please, read the information below before setting it to true.</b>
@@ -242,11 +248,11 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 	 * In the SDK 12.x the Buttonless DFU feature for Secure DFU was experimental.
 	 * It is NOT recommended to use it: it was not properly tested, had implementation bugs
 	 * (e.g. https://devzone.nordicsemi.com/question/100609/sdk-12-bootloader-erased-after-programming/)
-	 * and does not required encryption and therefore may lead to DOS attack (anyone can use it
+	 * and does not require encryption and therefore may lead to DOS attack (anyone can use it
 	 * to switch the device to bootloader mode). However, as there is no other way to trigger
 	 * bootloader mode on devices without a button, this DFU Library supports this service,
 	 * but the feature must be explicitly enabled here.
-	 * Be aware, that setting this flag to false will no protect your devices from this kind of
+	 * Be aware, that setting this flag to false will not protect your devices from this kind of
 	 * attacks, as an attacker may use another app for that purpose. To be sure your device is
 	 * secure remove this experimental service from your device.
 	 * <p>
@@ -260,11 +266,14 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 	 * 0x01 - Success<br>
 	 * The device should disconnect and restart in DFU mode after sending the notification.
 	 * <p>
-	 * In SDK 13 this issue will be fixed by a proper implementation (bonding required,
-	 * passing bond information to the bootloader, encryption, well tested).
-	 * It is recommended to use this new service when SDK 13 (or later) is out.
+	 * In SDK 14 this issue was fixed by Buttonless Service With Bonds.
 	 */
 	public static final String EXTRA_UNSAFE_EXPERIMENTAL_BUTTONLESS_DFU = "no.nordicsemi.android.dfu.extra.EXTRA_UNSAFE_EXPERIMENTAL_BUTTONLESS_DFU";
+	/**
+	 * The duration of a delay that will be added before sending each data packet in Secure DFU,
+	 * in milliseconds. This defaults to 0 for backwards compatibility reason.
+	 */
+	public static final String EXTRA_DATA_OBJECT_DELAY = "no.nordicsemi.android.dfu.extra.EXTRA_DATA_OBJECT_DELAY";
 	/**
 	 * This property must contain a boolean value.
 	 * <p>
@@ -623,6 +632,13 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 	 */
 	public static final int ERROR_DEVICE_NOT_BONDED = ERROR_MASK | 0x0E;
 	/**
+	 * Thrown when the DFU library lost track of what is going on. Reported number of bytes is
+	 * not equal to the number of bytes sent and due to some other events the library cannot recover.
+	 * <p>
+	 * Check https://github.com/NordicSemiconductor/Android-DFU-Library/issues/229
+	 */
+	public static final int ERROR_PROGRESS_LOST = ERROR_MASK | 0x0F;
+	/**
 	 * Flag set when the DFU target returned a DFU error. Look for DFU specification to get error
 	 * codes. The error code is binary OR-ed with one of: {@link #ERROR_REMOTE_TYPE_LEGACY},
 	 * {@link #ERROR_REMOTE_TYPE_SECURE} or {@link #ERROR_REMOTE_TYPE_SECURE_EXTENDED}.
@@ -799,6 +815,11 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 				mConnectionState = STATE_DISCONNECTED;
 				if (mDfuServiceImpl != null)
 					mDfuServiceImpl.getGattCallback().onDisconnected();
+
+				// Notify waiting thread
+				synchronized (mLock) {
+					mLock.notifyAll();
+				}
 			}
 		}
 	};
@@ -808,7 +829,7 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 		public void onReceive(final Context context, final Intent intent) {
 			// Obtain the device and check if this is the one that we are connected to
 			final BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-			if (!device.getAddress().equals(mDeviceAddress))
+			if (device == null || !device.getAddress().equals(mDeviceAddress))
 				return;
 
 			// Read bond state
@@ -826,7 +847,7 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 		public void onReceive(final Context context, final Intent intent) {
 			// Obtain the device and check it this is the one that we are connected to
 			final BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-			if (!device.getAddress().equals(mDeviceAddress))
+			if (device == null || !device.getAddress().equals(mDeviceAddress))
 				return;
 
 			final String action = intent.getAction();
@@ -867,16 +888,21 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 					mConnectionState = STATE_CONNECTED;
 
 					/*
-					 *  The onConnectionStateChange callback is called just after establishing connection and before sending Encryption Request BLE event in case of a paired device.
-					 *  In that case and when the Service Changed CCCD is enabled we will get the indication after initializing the encryption, about 1600 milliseconds later.
-					 *  If we discover services right after connecting, the onServicesDiscovered callback will be called immediately, before receiving the indication and the following
-					 *  service discovery and we may end up with old, application's services instead.
+					 * The onConnectionStateChange callback is called just after establishing connection and before sending Encryption Request BLE event in case of a paired device.
+					 * In that case and when the Service Changed CCCD is enabled we will get the indication after initializing the encryption, about 1600 milliseconds later.
+					 * If we discover services right after connecting, the onServicesDiscovered callback will be called immediately, before receiving the indication and the following
+					 * service discovery and we may end up with old, application's services instead.
 					 *
-					 *  This is to support the buttonless switch from application to bootloader mode where the DFU bootloader notifies the master about service change.
-					 *  Tested on Nexus 4 (Android 4.4.4 and 5), Nexus 5 (Android 5), Samsung Note 2 (Android 4.4.2). The time after connection to end of service discovery is about 1.6s
-					 *  on Samsung Note 2.
+					 * This is to support the buttonless switch from application to bootloader mode where the DFU bootloader notifies the master about service change.
+					 * Tested on Nexus 4 (Android 4.4.4 and 5), Nexus 5 (Android 5), Samsung Note 2 (Android 4.4.2). The time after connection to end of service discovery is about 1.6s
+					 * on Samsung Note 2.
 					 *
-					 *  NOTE: We are doing this to avoid the hack with calling the hidden gatt.refresh() method, at least for bonded devices.
+					 * NOTE: We are doing this to avoid the hack with calling the hidden gatt.refresh()
+					 * method, at least for bonded devices.
+					 *
+					 * IMPORTANT: BluetoothDevice.getBondState() returns true if the bond information
+					 * is present on Android, not necessarily when the link is established or even
+					 * encrypted. This is a security issue, but in here it does not matter.
 					 */
 					if (gatt.getDevice().getBondState() == BluetoothDevice.BOND_BONDED) {
 						logi("Waiting 1600 ms for a possible Service Changed indication...");
@@ -1030,7 +1056,9 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 		// By default, the service will be killed and recreated immediately after that,
 		// but we don't want it. User removed the task, so let's cancel DFU.
 		final NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-		manager.cancel(NOTIFICATION_ID);
+		if (manager != null) {
+			manager.cancel(NOTIFICATION_ID);
+		}
 		stopSelf();
 	}
 
@@ -1083,6 +1111,11 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 		String mimeType = intent.getStringExtra(EXTRA_FILE_MIME_TYPE);
 		mimeType = mimeType != null ? mimeType : (fileType == TYPE_AUTO ? MIME_TYPE_ZIP : MIME_TYPE_OCTET_STREAM);
 
+		// Some validation
+		if (deviceAddress == null || (filePath == null && fileUri == null && fileResId == 0)) {
+			loge("Device Address of firmware location are empty. Hint: use DfuServiceInitiator to start DFU");
+			return;
+		}
 		// Check file type and mime-type
 		if ((fileType & ~(TYPE_SOFT_DEVICE | TYPE_BOOTLOADER | TYPE_APPLICATION)) > 0 || !(MIME_TYPE_ZIP.equals(mimeType) || MIME_TYPE_OCTET_STREAM.equals(mimeType))) {
 			logw("File type or file mime-type not supported");
@@ -1105,6 +1138,11 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 					"Consider enabling foreground service using DfuServiceInitiator#setForeground(boolean)");
 		}
 		UuidHelper.assignCustomUuids(intent);
+
+		if (foregroundService) {
+			logi("Starting DFU service in foreground");
+			startForeground();
+		}
 
 		mDeviceAddress = deviceAddress;
 		mDeviceName = deviceName;
@@ -1133,9 +1171,6 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 				mbrSize = 0;
 		}
 
-		if (foregroundService) {
-			startForeground();
-		}
 		sendLogBroadcast(LOG_LEVEL_VERBOSE, "DFU service started");
 
 		/*
@@ -1285,6 +1320,7 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 			if (mError > 0) { // error occurred
 				if ((mError & ERROR_CONNECTION_STATE_MASK) > 0) {
 					final int error = mError & ~ERROR_CONNECTION_STATE_MASK;
+					logi("Connection error after: " + (after - before) + " ms");
 					final boolean timeout = error == 133 && after > before + 25000; // timeout is 30 sec
 					if (timeout) {
 						loge("Device not reachable. Check if the device with address " + deviceAddress + " is in range, is advertising and is connectable");
@@ -1301,6 +1337,7 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 				// Connection usually fails due to a 133 error (device unreachable, or.. something else went wrong).
 				// Usually trying the same for the second time works. Let's try 2 times.
 				final int attempt = intent.getIntExtra(EXTRA_RECONNECTION_ATTEMPT, 0);
+				logi("Attempt: " + (attempt + 1));
 				if (attempt < 2) {
 					sendLogBroadcast(LOG_LEVEL_WARNING, "Retrying...");
 
@@ -1443,7 +1480,7 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 		final String[] projection = {MediaStore.Images.Media.DISPLAY_NAME};
 		final Cursor cursor = getContentResolver().query(stream, projection, null, null, null);
 		try {
-			if (cursor.moveToNext()) {
+			if (cursor != null && cursor.moveToNext()) {
 				final String fileName = cursor.getString(0 /* DISPLAY_NAME*/);
 
 				if (fileName.toLowerCase(Locale.US).endsWith("hex"))
@@ -1495,14 +1532,26 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 
 		logi("Connecting to the device...");
 		final BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(address);
-		sendLogBroadcast(LOG_LEVEL_DEBUG, "gatt = device.connectGatt(autoConnect = false)");
-		final BluetoothGatt gatt = device.connectGatt(this, false, mGattCallback);
+		BluetoothGatt gatt;
+		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+			sendLogBroadcast(LOG_LEVEL_DEBUG, "gatt = device.connectGatt(autoConnect = false, TRANSPORT_LE, preferredPhy = LE_1M | LE_2M)");
+			gatt = device.connectGatt(this, false, mGattCallback,
+					BluetoothDevice.TRANSPORT_LE,
+					BluetoothDevice.PHY_LE_1M_MASK | BluetoothDevice.PHY_LE_2M_MASK);
+		} else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+			sendLogBroadcast(LOG_LEVEL_DEBUG, "gatt = device.connectGatt(autoConnect = false, TRANSPORT_LE)");
+			gatt = device.connectGatt(this, false, mGattCallback,
+					BluetoothDevice.TRANSPORT_LE);
+		} else {
+			sendLogBroadcast(LOG_LEVEL_DEBUG, "gatt = device.connectGatt(autoConnect = false)");
+			gatt = device.connectGatt(this, false, mGattCallback);
+		}
 
 		// We have to wait until the device is connected and services are discovered
 		// Connection error may occur as well.
 		try {
 			synchronized (mLock) {
-				while ((mConnectionState == STATE_CONNECTING || mConnectionState == STATE_CONNECTED) && mError == 0)
+				while ((mConnectionState == STATE_CONNECTING || mConnectionState == STATE_CONNECTED) && mError == 0 && !mAborted)
 					mLock.wait();
 			}
 		} catch (final InterruptedException e) {
@@ -1592,8 +1641,12 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 	 *
 	 * @param gatt the GATT device to be closed.
 	 */
-	protected void close(final BluetoothGatt gatt) {
+	protected void close(@NonNull final BluetoothGatt gatt) {
 		logi("Cleaning up...");
+		// Call disconnect() to make sure all resources are released. The device should already be
+		// disconnected, but that's OK.
+		sendLogBroadcast(LOG_LEVEL_DEBUG, "gatt.disconnect()");
+		gatt.disconnect();
 		sendLogBroadcast(LOG_LEVEL_DEBUG, "gatt.close()");
 		gatt.close();
 		mConnectionState = STATE_CLOSED;
@@ -1606,24 +1659,28 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 	 * @param gatt  the GATT device to be refreshed.
 	 * @param force <code>true</code> to force the refresh.
 	 */
-	protected void refreshDeviceCache(final BluetoothGatt gatt, final boolean force) {
+	protected void refreshDeviceCache(@NonNull final BluetoothGatt gatt, final boolean force) {
 		/*
-		 * If the device is bonded this is up to the Service Changed characteristic to notify Android that the services has changed.
-		 * There is no need for this trick in that case.
-		 * If not bonded, the Android should not keep the services cached when the Service Changed characteristic is present in the target device database.
-		 * However, due to the Android bug (still exists in Android 5.0.1), it is keeping them anyway and the only way to clear services is by using this hidden refresh method.
+		 * If the device is bonded this is up to the Service Changed characteristic to notify Android
+		 * that the services has changed. There is no need for this trick in that case.
+		 * If not bonded, the Android should not keep the services cached when the Service Changed
+		 * characteristic is present in the target device database.
+		 * However, due to the Android bug, it is keeping them anyway and the only way to clear
+		 * services is by using this hidden refresh method.
 		 */
 		if (force || gatt.getDevice().getBondState() == BluetoothDevice.BOND_NONE) {
 			sendLogBroadcast(LOG_LEVEL_DEBUG, "gatt.refresh() (hidden)");
 			/*
-			 * There is a refresh() method in BluetoothGatt class but for now it's hidden. We will call it using reflections.
+			 * There is a refresh() method in BluetoothGatt class but for now it's hidden.
+			 * We will call it using reflections.
 			 */
 			try {
 				//noinspection JavaReflectionMemberAccess
 				final Method refresh = gatt.getClass().getMethod("refresh");
+				//noinspection ConstantConditions
 				final boolean success = (Boolean) refresh.invoke(gatt);
 				logi("Refreshing result: " + success);
-			} catch (Exception e) {
+			} catch (final Exception e) {
 				loge("An exception occurred while refreshing device", e);
 				sendLogBroadcast(LOG_LEVEL_WARNING, "Refreshing failed");
 			}
@@ -1716,7 +1773,9 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 		updateProgressNotification(builder, progress);
 
 		final NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-		manager.notify(NOTIFICATION_ID, builder.build());
+		if (manager != null) {
+			manager.notify(NOTIFICATION_ID, builder.build());
+		}
 	}
 
 	/**
@@ -1773,7 +1832,9 @@ public abstract class DfuBaseService extends IntentService implements DfuProgres
 		updateErrorNotification(builder);
 
 		final NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-		manager.notify(NOTIFICATION_ID, builder.build());
+		if (manager != null) {
+			manager.notify(NOTIFICATION_ID, builder.build());
+		}
 	}
 
 	/**
